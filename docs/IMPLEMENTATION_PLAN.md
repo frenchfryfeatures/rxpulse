@@ -1,11 +1,11 @@
 # RxPulse for an Eye Care Hospital: Implementation Plan
 
-**Stack:** FastAPI (Python 3.12) backend · Next.js 15 (App Router, TypeScript) frontend · PostgreSQL 16 · Redis · Microsoft Entra ID (MSAL) · in-app RBAC · LLM agent layer
+**Stack:** FastAPI (Python 3.12) backend · Next.js 16 (App Router, TypeScript) frontend · PostgreSQL 16 · Redis · Microsoft Entra ID (MSAL) · in-app RBAC · LLM agent layer
 
 This plan covers:
 
 - how the agent architecture diagram (RxPulse Orchestrator plus 8 specialist agents) maps to backend services, and
-- how the reference MedStock IQ UI (sidebar shell, RBAC screen, FEFO sales orders, batch inventory) is adapted for an **eye care hospital**. That means a hospital pharmacy, an OT/surgery store, vendor-owned IOL consignment stock, an optical shop, and billing.
+- how the reference MedStock IQ UI (sidebar shell, RBAC screen, FEFO sales orders, batch inventory) is adapted for an **eye care hospital**. That means a single in-hospital pharmacy, an OT/surgery store, vendor-owned IOL consignment stock, and billing. There is **no optical shop**: the pharmacy is the only point of dispensing, both for internal requests (doctors, surgeons, OT, wards) and for counter sales to patients and walk-in buyers.
 
 ---
 
@@ -36,11 +36,10 @@ This plan covers:
 |---|---|
 | **Admin** | Dashboard, approvals (POs, write-offs, returns), staff and role management |
 | **Doctor / Surgeon** | Prescriptions (drops, oral meds), surgery orders (procedure plus IOL power/model) |
-| **Pharmacist** | Dispense medications, FEFO picking, Schedule H/H1 register |
+| **Pharmacist** | Runs the hospital pharmacy: fulfils doctor/surgeon/OT requisitions, sells to patients and walk-in buyers at the counter (prescription or OTC), FEFO picking, returns, Schedule H/H1 register |
 | **Staff / OT Nurse** | Scan items into/out of surgery kits, log intra-op usage |
 | **Store Keeper** | Goods receipt, bins, transfers, stock adjustments |
 | **Procurement Officer** | Vendors, purchase orders, restock |
-| **Optical Shop Staff** | Frames/lens/contact-lens sales, spectacle job orders |
 | **Billing / Accountant** | Reconciliation, patient invoices, vendor payables |
 | **Analyst** | Read-only reports and forecasts |
 
@@ -52,7 +51,6 @@ This plan covers:
 | High-value drugs | Anti-VEGF injections (Ranibizumab, Aflibercept, Bevacizumab), Mitomycin-C | **Serial-level tracking**, cold-chain flag, per-dose accounting |
 | Surgical consumables | Viscoelastic (OVD), BSS, blades (keratome 2.8mm, 15°), cannulas, drapes, sutures (10-0 nylon), phaco packs | Batch/expiry, BOM-driven kits, open-vs-used tracking |
 | **IOLs (consignment)** | Monofocal/toric/multifocal, by model and **diopter power** (e.g. +21.5D) | **Vendor-owned** until implanted, serial per lens, auto restock notification |
-| Optical shop | Frames, spectacle lenses (by index/coating/Rx), contact lenses, solutions | Retail SKUs, dead stock, margin analytics, lab job orders |
 
 ### Surgical procedures to model as BOMs (seed data)
 
@@ -65,10 +63,10 @@ Phaco cataract with IOL, MSICS, Trabeculectomy, Pars plana vitrectomy, Intravitr
 ```mermaid
 flowchart LR
   subgraph Users
-    A[Admin] & D[Doctor] & P[Pharmacist] & N[Staff/Nurse] & O[Optical] & B[Billing]
+    A[Admin] & D[Doctor] & P[Pharmacist] & N[Staff/Nurse] & B[Billing] & WI[Walk-in buyer<br/>via pharmacy counter]
   end
 
-  subgraph Web["Next.js 15 (App Router)"]
+  subgraph Web["Next.js 16 (App Router)"]
     UI[Hospital Portal UI]
     MSAL["@azure/msal-react<br/>Auth Code + PKCE"]
   end
@@ -81,7 +79,7 @@ flowchart LR
   subgraph API["FastAPI"]
     AUTH[JWT validation<br/>JWKS cache]
     RBAC[RBAC / permission deps]
-    DOM[Domain services<br/>inventory · pharmacy · surgery · consignment<br/>optical · procurement · billing]
+    DOM[Domain services<br/>inventory · pharmacy · surgery · consignment<br/>procurement · billing]
     ORCH[RxPulse Orchestrator Agent]
     AG[Specialist agents x8]
   end
@@ -228,7 +226,7 @@ UserRole    = (user, role, location_id?)   location_id NULL → applies to all l
 Effective   = ∪ permissions of all user's roles, filtered to the request's location
 ```
 
-Locations (seed): `Central Warehouse`, `Main Pharmacy`, `OT Store`, `Optical Shop`, plus satellite clinics.
+Locations (seed): `Central Warehouse` (hospital store), `Main Pharmacy`, `OT Store`.
 
 ### 4.2 Permission catalogue
 
@@ -237,10 +235,9 @@ Locations (seed): `Central Warehouse`, `Main Pharmacy`, `OT Store`, `Optical Sho
 | Dashboard | `dashboard:view` |
 | Inventory | `inventory:view` · `inventory:adjust` · `inventory:transfer` · `inventory:writeoff` · `inventory:writeoff_approve` · `item:manage` |
 | Procurement | `vendor:view` · `vendor:manage` · `po:view` · `po:create` · `po:approve` · `grn:create` |
-| Pharmacy | `rx:view` · `rx:create` (doctor) · `dispense:create` · `controlled:register_view` |
+| Pharmacy | `rx:view` · `rx:create` (doctor) · `pharmacy_order:view` · `pharmacy_order:create` · `pharmacy_order:dispatch` · `pharmacy_order:return` · `requisition:create` (doctor/OT) · `controlled:register_view` |
 | Surgery | `surgery:view` · `surgery:schedule` · `bom:view` · `bom:manage` · `kit:issue` · `intraop:log` · `kit:return` |
 | Consignment IOL | `consignment:view` · `consignment:receive` · `consignment:consume` · `consignment:restock_request` |
-| Optical shop | `optical:view` · `optical:sell` · `optical:job_order` · `optical:price_manage` |
 | Billing | `billing:view` · `billing:reconcile` · `invoice:create` · `invoice:void` · `payable:manage` |
 | Analytics | `reports:view` · `reports:export` · `forecast:view` |
 | AI | `ai:chat` · `ai:approve_actions` |
@@ -252,12 +249,11 @@ Locations (seed): `Central Warehouse`, `Main Pharmacy`, `OT Store`, `Optical Sho
 |---|---|
 | **Super Admin** | `*` (all). Cannot be deleted. At least one active holder must always exist. |
 | **Hospital Admin** | Everything except `settings:manage`/`role:manage` on system roles; includes all `*:approve` |
-| **Doctor / Surgeon** | `rx:*`, `surgery:view`, `surgery:schedule`, `bom:view`, `consignment:view`, `forecast:view`, `ai:chat` |
-| **Pharmacist** | `inventory:view`, `rx:view`, `dispense:create`, `controlled:register_view`, `inventory:adjust`, `ai:chat` |
-| **OT Nurse / Staff** | `surgery:view`, `bom:view`, `kit:issue`, `intraop:log`, `kit:return`, `consignment:consume` |
+| **Doctor / Surgeon** | `rx:*`, `requisition:create`, `pharmacy_order:view` (own), `surgery:view`, `surgery:schedule`, `bom:view`, `consignment:view`, `forecast:view`, `ai:chat` |
+| **Pharmacist** | `inventory:view`, `rx:view`, `pharmacy_order:*`, `controlled:register_view`, `inventory:adjust`, `reports:view`, `ai:chat` |
+| **OT Nurse / Staff** | `surgery:view`, `bom:view`, `requisition:create`, `kit:issue`, `intraop:log`, `kit:return`, `consignment:consume` |
 | **Store Keeper** | `inventory:*` (not `writeoff_approve`), `grn:create`, `consignment:receive`, `po:view` |
 | **Procurement Officer** | `vendor:*`, `po:view`, `po:create`, `consignment:restock_request`, `forecast:view` |
-| **Optical Shop Staff** | `optical:view`, `optical:sell`, `optical:job_order`, `inventory:view` (location-scoped to Optical Shop) |
 | **Billing / Accountant** | `billing:*`, `invoice:*`, `payable:manage`, `reports:view` |
 | **Analyst** | `*:view`, `reports:*`, `forecast:view` (read-only) |
 
@@ -346,14 +342,14 @@ erDiagram
 | Area | Tables | Notes |
 |---|---|---|
 | Identity/RBAC | `users(oid, tid, email, display_name, status[invited/active/inactive])`, `roles(name, description, is_system)`, `permissions(code, module, description)`, `role_permissions`, `user_roles(user_id, role_id, location_id NULL)` | Unique `(tid, oid)`. Unique lower(email). |
-| Master | `locations`, `bins`, `items(sku, name, generic, type[drug/consumable/iol/frame/spectacle_lens/contact_lens/equipment], schedule[H/H1/X/none], hsn, gst_rate, uom, par_min, par_max, is_serialized, is_cold_chain)`, `iol_specs(item_id, model, optic_type, diopter_min/max/step, a_constant)`, `vendors(gstin, contact, lead_time_days, channel[email/api])` | IOL specs drive power-matching |
+| Master | `locations`, `bins`, `items(sku, name, generic, type[drug/consumable/iol/equipment], schedule[H/H1/X/none], hsn, gst_rate, uom, par_min, par_max, is_serialized, is_cold_chain)`, `iol_specs(item_id, model, optic_type, diopter_min/max/step, a_constant)`, `vendors(gstin, contact, lead_time_days, channel[email/api])` | IOL specs drive power-matching |
 | Stock | `batches(item_id, batch_no, expiry_date, mfg_date, mrp, unit_cost, vendor_id, serial_no NULL)`, `stock_ledger(batch_id, location_id, bin_id, qty_delta, reason, ref_type, ref_id, idempotency_key UNIQUE)`, `stock_balances(batch_id, location_id, bin_id, qty_on_hand, qty_reserved)` | `stock_balances` is updated in the **same transaction** as the ledger insert, using `SELECT … FOR UPDATE`. A CHECK keeps `qty_on_hand >= 0`. |
 | Procurement | `purchase_orders(status[draft/pending_approval/approved/sent/partially_received/closed/cancelled], source[manual/agent])`, `po_lines`, `grns`, `grn_lines` | |
 | Consignment | `consignment_units(vendor_id, item_id, serial_no, diopter, status[in_stock/reserved/implanted/returned], location_id)`, `consignment_usage(unit_id, surgery_case_id, implanted_at, notified_vendor_at)`, `restock_requests(vendor_id, lines, status)` | Consignment units are **not** hospital assets (valuation excluded) until implanted, when a payable is created |
 | Clinical (minimal) | `patients(mrn, name, dob, gender, phone)` (or HIS reference), `prescriptions`, `rx_lines(item_id, dose, eye[OD/OS/OU], frequency, duration)`, `dispensations(rx_line_id, batch_id, qty)` | Keep PHI to a minimum. MRN links to the HIS if one exists. |
 | Surgery | `procedures(code, name, default_duration)`, `bom_lines(procedure_id, item_id, qty, is_optional, substitution_group)`, `surgery_cases(patient_id, procedure_id, surgeon_id, eye, scheduled_at, iol_item_id, iol_power, status)`, `surgery_kits(case_id, status[allocated/issued/returned/reconciled])`, `kit_lines(kit_id, batch_id or consignment_unit_id, qty_allocated, qty_used, qty_returned, qty_wasted)`, `intraop_events(case_id, kit_line_id, action[opened/used/wasted/added], qty, scanned_barcode, actor_id, ts)` | |
 | Billing | `invoices(patient_id, case_id, status, subtotal, gst, total)`, `invoice_lines`, `payments`, `vendor_payables` | |
-| Optical | `optical_orders(patient_id, type[sale/job_order])`, `optical_order_lines`, `spectacle_rx(sph, cyl, axis, add, pd, per eye)`, `lab_job_orders` | |
+| Pharmacy orders | `pharmacy_orders(order_no, channel[counter_sale/requisition], patient_id NULL, walk_in_name/phone, requested_by (doctor/OT user), department, surgery_case_id NULL, prescription_id NULL, status[draft/allocated/dispatched/returned/partially_returned/cancelled], invoice_no)`, `pharmacy_order_lines(item_id, qty, unit_price, gst_rate)`, `pharmacy_order_allocations(line_id, batch_id, qty)`, `pharmacy_returns` | The same FEFO order pipeline serves both channels. Counter sales produce a GST invoice; requisitions are charged to the department/surgery case instead. |
 | Analytics | `forecasts(item_id, location_id, period, qty_pred, method, generated_at)`, `alerts(type[expiry/par/stockout/dead_stock/burn_rate], severity, item_id, status)` | |
 | AI | `agent_runs(user_id, agent, input, status, tokens, cost)`, `agent_tool_calls(run_id, tool, args, result, duration)`, `proposed_actions(run_id, type, payload, status[pending/approved/rejected/executed], approver_id)`, `chat_threads`, `chat_messages` | |
 | Audit | `audit_log(actor_id, actor_type[user/agent/system], action, entity_type, entity_id, before, after, ip, request_id, ts, prev_hash, hash)` | Append-only. The DB role has no UPDATE/DELETE. A hash chain provides tamper evidence. |
@@ -382,7 +378,7 @@ backend/
 │   ├── services/               # domain logic, the ONLY place that writes
 │   │   ├── stock.py            # ledger posting, FEFO allocator, reservations
 │   │   ├── procurement.py  pharmacy.py  surgery.py  consignment.py
-│   │   ├── optical.py  billing.py  analytics.py  staff.py  audit.py
+│   │   ├── billing.py  analytics.py  staff.py  audit.py
 │   ├── api/v1/                 # routers (thin; call services)
 │   ├── agents/
 │   │   ├── orchestrator.py     # intent routing + tool loop
@@ -404,11 +400,10 @@ backend/
 | `items` | CRUD `/items`, `GET /items/{id}/stock` (inventory:view / item:manage) |
 | `inventory` | `GET /batches?status=&location=&expiring_within=&sort=` · `GET /batches/{id}` · `POST /stock/adjustments` · `POST /stock/transfers` · `POST /stock/writeoffs` + `/approve` · `GET /stock/expiry-risk` · `POST /stock/fefo/preview` (dry-run allocation) |
 | `procurement` | `/vendors` CRUD · `/purchase-orders` CRUD · `POST /purchase-orders/{id}/submit` · `/approve` · `/send` · `POST /grns` (receive into warehouse, creates batches) |
-| `pharmacy` | `/prescriptions` (rx:create) · `GET /prescriptions/queue` · `POST /dispensations` (FEFO auto-pick, returns pick list) · `GET /registers/schedule-h1` |
+| `pharmacy` | `/prescriptions` (rx:create) · `GET /pharmacy/orders?channel=&status=&q=&sort=` · `POST /pharmacy/orders` (counter sale or requisition; FEFO auto-allocation) · `GET /pharmacy/orders/{id}/pick-list` · `POST /pharmacy/orders/{id}/dispatch` · `POST /pharmacy/orders/{id}/return` · `POST /pharmacy/orders/{id}/cancel` · `GET /registers/schedule-h1` |
 | `consignment` | `GET /consignment/units?model=&diopter=` · `POST /consignment/receive` · `POST /consignment/units/{id}/reserve` · `POST /consignment/units/{id}/implant` · `GET/POST /consignment/restock-requests` |
 | `surgery` | `/procedures` + `/procedures/{id}/bom` · `/surgery-cases` CRUD · `POST /surgery-cases/{id}/kit` (allocate from BOM with FEFO + IOL reserve) · `POST /kits/{id}/issue` · `POST /surgery-cases/{id}/intraop-events` (barcode scan) · `POST /kits/{id}/return` |
 | `billing` | `POST /surgery-cases/{id}/reconcile` → returns allocated vs used diff · `POST /invoices` · `GET /invoices/{id}/pdf` · `POST /invoices/{id}/void` · `/payables` |
-| `optical` | `/optical/orders` · `/optical/job-orders` · `GET /optical/analytics` |
 | `analytics` | `GET /dashboard/summary` · `GET /reports/{name}?format=csv/xlsx` · `GET /forecasts` · `GET /alerts` + `PATCH` ack |
 | `ai` | `POST /ai/chat` (SSE stream) · `GET /ai/threads` · `GET /ai/actions?status=pending` · `POST /ai/actions/{id}/approve` · `/reject` |
 | `audit` | `GET /audit?entity=&actor=&from=&to=` (audit:view) |
@@ -462,7 +457,7 @@ allocate(item_id, qty, location_id, exclude_expiring_within_days=30 (drugs) / 90
 | **Procurement** | `get_par_breaches`, `get_vendor_catalog`, `get_open_pos` | `draft_purchase_order` → PO in `draft`, needs `po:approve` | PAR alert, forecast shortfall, chat |
 | **Pharmacy** | `get_stock`, `get_expiring`, `get_rx_queue` | `propose_transfer`, `propose_writeoff` | Nightly expiry scan (FEFO rotation, PAR alerts), chat |
 | **Consignment IOL** | `find_iol(model, power)`, `get_consignment_levels` | `create_restock_request` (**auto-executes** under a vendor policy, since it's vendor-owned and costs nothing), `notify_vendor` | `consignment.implanted` event |
-| **Retail Analytics** (optical) | `sales_trend`, `dead_stock(days=180)`, `margin_by_category` | none (read-only) | Weekly report, chat |
+| **Retail Analytics** (pharmacy counter) | `sales_trend`, `dead_stock(days=180)`, `margin_by_category` | none (read-only) | Weekly report, chat |
 | **Surgery BOM** | `get_bom(procedure)`, `check_kit_availability(case_id)` | `propose_bom_change` (needs `bom:manage`) | Case scheduled → availability check 48h before |
 | **Intra-Op Tracking** | `get_kit(case_id)`, `get_usage_log` | `log_usage` (direct, **user-initiated only**, e.g. voice/scan) | Live case |
 | **Reconciliation & Billing** | `reconcile_case`, `get_tariff` | `draft_invoice` → billing approves | Case status `completed` |
@@ -481,7 +476,7 @@ Forecasting (phase 4):
 
 ### 8.1 Stack
 
-Next.js 15 App Router · TypeScript · Tailwind CSS · shadcn/ui (Radix) · lucide-react icons (matches the reference) · TanStack Query · TanStack Table · react-hook-form + zod · `openapi-typescript` + `openapi-fetch` for a typed API client · Recharts · `@azure/msal-browser` + `@azure/msal-react` · `html5-qrcode` / camera barcode scanning for OT.
+Next.js 16 App Router · TypeScript · Tailwind CSS · shadcn/ui (Radix) · lucide-react icons (matches the reference) · TanStack Query · TanStack Table · react-hook-form + zod · `openapi-typescript` + `openapi-fetch` for a typed API client · Recharts · `@azure/msal-browser` + `@azure/msal-react` · `html5-qrcode` / camera barcode scanning for OT.
 
 ### 8.2 Layout
 
@@ -495,10 +490,9 @@ frontend/src/
 │       ├── dashboard/
 │       ├── ai-studio/
 │       ├── inventory/             # tabs: active-batches | catalog | fefo | expiry-risk | adjustments
-│       ├── pharmacy/              # rx-queue | dispense/[rxId] | registers
+│       ├── pharmacy/              # orders (counter sales + requisitions) | returns | registers
 │       ├── surgery/               # schedule | cases/[id] (kit, intra-op, reconcile) | bom
 │       ├── consignment/           # iol-stock | usage | restock-requests
-│       ├── optical/               # pos | job-orders | analytics
 │       ├── purchasing/            # purchase-orders | grn | vendors
 │       ├── billing/               # reconciliation | invoices | payables
 │       ├── reports/
@@ -524,10 +518,9 @@ frontend/src/
 | **Dashboard** | KPI tiles (stock value, expiring in 30/60/90 days, stock-outs, today's surgeries, pending approvals), alerts list, surgery kit readiness | Tiles are role-aware: a nurse sees today's cases, billing sees unreconciled cases |
 | **AI Studio** (Agent badge) | Full chat with the orchestrator. Streaming, tool-call timeline, **Proposed Actions** cards with Approve/Reject | The floating "Ask RxPulse Assist" button opens the same chat in a drawer |
 | **Inventory** (count badge) | Tabs as in the reference: *All Active Batches · Medicines Catalog · FEFO Allocation Engine · Expiry Risk Analysis · Stock Adjustments*. Columns: Item & SKU, Batch, Inward date, Expiry (colour-coded relative chip), Status, Available, Location/Bin, Valuation, Actions (View/Edit/Transfer) | Location filter. IOLs shown with power. |
-| **Pharmacy** | Rx queue → dispense screen with auto FEFO pick list, barcode verify, print label | Schedule H1 register view |
+| **Pharmacy** | Mirrors the reference *Sales Orders & FEFO Dispatch* screen. Tabs: **Counter Sales** (patients / walk-in buyers, Rx or OTC) · **Doctor & OT Requisitions** · **Returns**. Columns: Order #, Patient / Requested by, Date, FEFO batches allocated, Total, Invoice #, Status, Actions (Pick List / Dispatch / Return, shown by status) | Schedule H/H1 items require a prescription reference on counter sales. Schedule H1 register view. |
 | **Surgery** | Calendar/list of cases → case page with steps **Kit → Issue → Intra-op → Return → Reconcile** | Intra-op screen is **tablet-first** with big scan button and +/−/wasted per line, and works offline-tolerant (queued mutations) |
 | **Consignment IOL** | Matrix view: model × diopter grid with on-hand counts; usage log; restock requests with vendor status | |
-| **Optical Shop** | POS-style sale, spectacle Rx entry, lab job orders, retail analytics (dead stock, margin) | |
 | **Purchasing** | POs list (status chips, source: Manual/Agent), PO detail with approval, GRN receiving with batch/expiry capture | |
 | **Billing** | Reconciliation queue (allocated vs used table), invoices list/detail/PDF, vendor payables | |
 | **Reports** | Consumption, expiry loss, procedure costing, vendor performance, forecasts; export CSV/XLSX | |
@@ -570,11 +563,34 @@ sequenceDiagram
   Bl->>S: review allocated vs used → approve invoice (bill actual usage only)
 ```
 
-### 9.2 Replenishment
+### 9.2 Pharmacy dispensing (single pharmacy, two channels)
+
+```mermaid
+flowchart LR
+  subgraph In[Who asks]
+    DR[Doctor / Surgeon<br/>requisition]
+    OT[OT / Ward staff<br/>requisition]
+    PT[Patient with Rx<br/>counter sale]
+    WI[Walk-in buyer<br/>OTC counter sale]
+  end
+  In --> ORD[Pharmacy order<br/>channel = requisition / counter_sale]
+  ORD --> FEFO[FEFO allocation<br/>earliest expiry first, min shelf-life]
+  FEFO --> PICK[Pick list]
+  PICK --> DSP[Dispatch<br/>stock ledger: issue]
+  DSP -->|counter_sale| INV[GST invoice to patient]
+  DSP -->|requisition| CHG[Charged to department / surgery case]
+  DSP --> RET[Return<br/>stock ledger: return into same batch]
+```
+
+- **Requisitions** come from doctors, surgeons, OT and wards. They carry `requested_by`, a department and optionally a surgery case, and are not invoiced to a walk-in customer.
+- **Counter sales** go to registered patients or walk-in buyers (name + phone). Schedule H/H1 items can't be sold without a prescription reference; OTC items can.
+- Both channels share one order pipeline: create → FEFO allocate (reserves stock) → pick list → dispatch (posts issue to the ledger) → optional return (posts back into the original batch).
+
+### 9.3 Replenishment
 
 Nightly PAR check or forecast shortfall → the **Procurement Agent** drafts a PO grouped by vendor → an approver with `po:approve` reviews it in Purchasing or in the AI Studio action card → PO is sent (email PDF / vendor API) → Store Keeper posts the GRN with batch and expiry → stock becomes available in the warehouse → transfers to Pharmacy / OT Store.
 
-### 9.3 Expiry management
+### 9.4 Expiry management
 
 Daily job → batches expiring within the configured windows raise `alerts`. The Pharmacy Agent suggests actions:
 
@@ -646,7 +662,7 @@ The Expiry Risk tab shows value at risk by bucket.
 | **2. Inventory core** (wk 4–6) | Items, locations/bins, batches, ledger/balances, FEFO engine, adjustments/transfers/write-off approval, Inventory screens + expiry risk, vendors, POs with approval, GRN | Receive → stock visible → transfer → FEFO pick works, with no oversell under concurrency |
 | **3. Clinical flows** (wk 7–10) | Pharmacy Rx + dispense + H1 register; procedures/BOM; surgery cases, kits, tablet intra-op scanning; consignment IOL receive/reserve/implant/restock; reconciliation + invoices (PDF, GST) | Full cataract flow (9.1) passes as a Playwright E2E |
 | **4. Agents** (wk 11–13) | Orchestrator + 8 agents, SSE chat, proposed actions approval, event triggers, nightly jobs (expiry, PAR, forecasts), notifications | Agents respect RBAC (tests); PO drafted by agent → approved → sent |
-| **5. Optical + analytics** (wk 14–15) | Optical POS/job orders, retail analytics, dashboards, reports export | |
+| **5. Analytics** (wk 14–15) | Pharmacy sales analytics (trends, dead stock, margin), dashboards, reports export | |
 | **6. Hardening** (wk 16) | Pen test fixes, load test, backup/restore drill, runbooks, UAT with each role | Go-live checklist signed |
 
 ---
