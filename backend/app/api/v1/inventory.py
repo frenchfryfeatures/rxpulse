@@ -11,7 +11,7 @@ from app.api.deps import DB, require
 from app.core.config import get_settings
 from app.core.errors import conflict, not_found
 from app.core.rbac import Principal, ensure
-from app.models import Batch, Item, ItemType, Location, StockBalance, StockLedger
+from app.models import Batch, Item, ItemType, Location, StockBalance, StockLedger, User
 from app.schemas.common import Page
 from app.schemas.inventory import (
     AdjustmentIn,
@@ -153,12 +153,31 @@ async def list_batches(
 
 
 @router.get("/batches/{batch_id}/ledger", response_model=list[LedgerOut])
-async def batch_ledger(batch_id: uuid.UUID, db: DB, p: Principal = Depends(require("inventory:view"))) -> list:
-    stmt = select(StockLedger).where(StockLedger.batch_id == batch_id)
+async def batch_ledger(
+    batch_id: uuid.UUID, db: DB, p: Principal = Depends(require("inventory:view"))
+) -> list[LedgerOut]:
+    stmt = _ledger_query().where(StockLedger.batch_id == batch_id)
     locs = p.locations_for("inventory:view")
     if locs is not None:
         stmt = stmt.where(StockLedger.location_id.in_(locs))
-    return list((await db.scalars(stmt.order_by(StockLedger.created_at.desc()).limit(200))).all())
+    rows = (await db.execute(stmt.order_by(StockLedger.created_at.desc()).limit(200))).all()
+    return [_ledger_out(r) for r in rows]
+
+
+def _ledger_query():
+    return (
+        select(StockLedger, Batch.batch_no, Item.name, Item.sku, Location.name, User.display_name)
+        .join(Batch, Batch.id == StockLedger.batch_id)
+        .join(Item, Item.id == Batch.item_id)
+        .join(Location, Location.id == StockLedger.location_id)
+        .outerjoin(User, User.id == StockLedger.actor_id)
+    )
+
+
+def _ledger_out(row) -> LedgerOut:
+    led, batch_no, item_name, sku, loc_name, actor = row
+    return LedgerOut.model_validate(led).model_copy(update={
+        "batch_no": batch_no, "item_name": item_name, "sku": sku, "location_name": loc_name, "actor_name": actor})
 
 
 # ----------------------------------------------------------------------------- stock movements
@@ -244,7 +263,7 @@ async def movements(
     db: DB, p: Principal = Depends(require("inventory:view")), location_id: uuid.UUID | None = None,
     reason: str | None = None, page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100),
 ) -> Page[LedgerOut]:
-    stmt = select(StockLedger)
+    stmt = _ledger_query()
     locs = p.locations_for("inventory:view")
     if locs is not None:
         stmt = stmt.where(StockLedger.location_id.in_(locs))
@@ -253,6 +272,6 @@ async def movements(
     if reason:
         stmt = stmt.where(StockLedger.reason == reason)
     total = int(await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
-    rows = (await db.scalars(stmt.order_by(StockLedger.created_at.desc()).offset((page - 1) * page_size)
+    rows = (await db.execute(stmt.order_by(StockLedger.created_at.desc()).offset((page - 1) * page_size)
                              .limit(page_size))).all()
-    return Page(items=[LedgerOut.model_validate(r) for r in rows], total=total, page=page, page_size=page_size)
+    return Page(items=[_ledger_out(r) for r in rows], total=total, page=page, page_size=page_size)

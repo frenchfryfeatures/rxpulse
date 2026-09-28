@@ -145,6 +145,11 @@ class LedgerOut(ORM):
     ref_id: str | None
     actor_id: uuid.UUID | None
     created_at: datetime
+    item_name: str = ""
+    sku: str = ""
+    batch_no: str = ""
+    location_name: str = ""
+    actor_name: str | None = None
 
 
 class ExpiryBucket(BaseModel):

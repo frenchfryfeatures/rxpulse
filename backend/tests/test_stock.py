@@ -123,3 +123,12 @@ async def test_concurrent_sales_never_oversell(api, db):
     reserved = await db.scalar(select(func.sum(StockBalance.qty_reserved)).where(StockBalance.location_id == pharmacy)
                                .where(StockBalance.batch_id.in_(select(StockBalance.batch_id))))
     assert reserved >= 30
+
+
+async def test_movements_are_readable(api):
+    async with api.as_(ADMIN) as c:
+        page = (await c.get("/stock/movements", params={"reason": "issue"})).json()
+    assert page["total"] > 0
+    row = page["items"][0]
+    assert row["item_name"] and row["batch_no"] and row["location_name"] == "Main Pharmacy"
+    assert row["actor_name"] == "Farhan Qureshi" and row["qty_delta"] < 0
